@@ -198,15 +198,119 @@ class SmolvmConfigTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             SmolvmConfig(image="a", environment={"OK": "line\nbreak"})
 
-    def test_keyring_names_cannot_collide_with_env(self):
-        key = {"key_name": "app", "service": "svc", "env_var": "APP_API_KEY"}
-        SmolvmConfig(image="a", keys=[key])
+    def test_secret_names_cannot_collide_with_env(self):
+        secret = {"env_var": "APP_API_KEY", "keychain": "omnigent/app"}
+        SmolvmConfig(image="a", secrets=[secret])
         with self.assertRaises(ValidationError):
-            SmolvmConfig(image="a", keys=[key, key])
+            SmolvmConfig(image="a", secrets=[secret, secret])
         with self.assertRaises(ValidationError):
-            SmolvmConfig(image="a", env=["APP_API_KEY"], keys=[key])
+            SmolvmConfig(image="a", env=["APP_API_KEY"], secrets=[secret])
         with self.assertRaises(ValidationError):
-            SmolvmConfig(image="a", environment={"APP_API_KEY": "x"}, keys=[key])
+            SmolvmConfig(image="a", environment={"APP_API_KEY": "x"}, secrets=[secret])
+
+    def test_a_secret_has_exactly_one_source(self):
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(image="a", secrets=[{"env_var": "K"}])
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(
+                image="a",
+                secrets=[{"env_var": "K", "keychain": "s/a", "env": "HOST"}],
+            )
+        SmolvmConfig(image="a", secrets=[{"env_var": "K", "env": "HOST"}])
+        SmolvmConfig(image="a", secrets=[{"env_var": "K", "file": "/run/k"}])
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(image="a", secrets=[{"env_var": "K", "file": "relative"}])
+
+    def test_keychain_items_are_service_or_service_account(self):
+        for item in ("omnigent", "omnigent/github"):
+            SmolvmConfig(image="a", secrets=[{"env_var": "K", "keychain": item}])
+        for item in ("/github", "omnigent/"):
+            with self.assertRaises(ValidationError):
+                SmolvmConfig(image="a", secrets=[{"env_var": "K", "keychain": item}])
+
+    def test_secret_and_credential_arguments_render_native_flags(self):
+        config = SmolvmConfig(
+            image="a",
+            allow_host_patterns=["*.atlassian.com"],
+            secrets=[
+                {"env_var": "GIT_TOKEN", "keychain": "omnigent/git"},
+                {"env_var": "FROM_ENV", "env": "HOST_VAR"},
+                {"env_var": "FROM_FILE", "file": "/run/secret"},
+            ],
+            credentials=[
+                {"name": "jira", "env_var": "JIRA_TOKEN", "hosts": ["api.atlassian.com"]},
+            ],
+        )
+        args = SmolvmSandboxLauncher(config=config)._create_args("omni-x", "x", None)
+        self.assertIn("--secret-keychain", args)
+        self.assertIn("GIT_TOKEN=omnigent/git", args)
+        self.assertIn("FROM_ENV=HOST_VAR", args)
+        self.assertIn("FROM_FILE=/run/secret", args)
+        self.assertIn("jira=JIRA_TOKEN@api.atlassian.com", args)
+
+    def test_a_credential_can_carry_its_own_keychain_source(self):
+        config = SmolvmConfig(
+            image="a",
+            allow_host_patterns=["*.atlassian.com"],
+            credentials=[
+                {
+                    "name": "jira",
+                    "env_var": "JIRA_TOKEN",
+                    "hosts": ["api.atlassian.com"],
+                    "keychain": "omnigent/jira",
+                }
+            ],
+        )
+        args = SmolvmSandboxLauncher(config=config)._create_args("omni-x", "x", None)
+        self.assertIn("JIRA_TOKEN=omnigent/jira", args)
+        self.assertIn("jira=JIRA_TOKEN@api.atlassian.com", args)
+        with self.assertRaisesRegex(ValidationError, "declare the source once"):
+            SmolvmConfig(
+                image="a",
+                allow_host_patterns=["*.atlassian.com"],
+                secrets=[{"env_var": "JIRA_TOKEN", "keychain": "omnigent/jira"}],
+                credentials=[
+                    {
+                        "name": "jira",
+                        "env_var": "JIRA_TOKEN",
+                        "hosts": ["api.atlassian.com"],
+                        "keychain": "omnigent/jira",
+                    }
+                ],
+            )
+
+    def test_a_credential_host_must_be_reachable(self):
+        with self.assertRaisesRegex(ValidationError, "no allow_hosts"):
+            SmolvmConfig(
+                image="a",
+                credentials=[{"name": "j", "env_var": "T", "hosts": ["api.atlassian.com"]}],
+            )
+        SmolvmConfig(
+            image="a",
+            allow_host_patterns=["*.atlassian.com"],
+            credentials=[{"name": "j", "env_var": "T", "hosts": ["api.atlassian.com"]}],
+        )
+        SmolvmConfig(
+            image="a",
+            allow_hosts=["atlassian.com"],
+            credentials=[{"name": "j", "env_var": "T", "hosts": ["api.atlassian.com"]}],
+        )
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(
+                image="a",
+                allow_host_patterns=["*.atlassian.com"],
+                credentials=[{"name": "j", "env_var": "T", "hosts": ["atlassian.com"]}],
+            )
+
+    def test_ssh_agent_is_a_boolean_and_forwards_the_flag(self):
+        plain = SmolvmSandboxLauncher(config=SmolvmConfig(image="alpine"))
+        self.assertNotIn("--ssh-agent", plain._create_args("omni-x", "x", None))
+        forwarded = SmolvmSandboxLauncher(
+            config=SmolvmConfig(image="alpine", ssh_agent=True)
+        )
+        self.assertIn("--ssh-agent", forwarded._create_args("omni-x", "x", None))
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(image="alpine", ssh_agent="yes please")
 
     def test_profile_model_binds_the_alias_identity(self):
         model = profile_config_model("smolvm-python")
@@ -215,12 +319,12 @@ class SmolvmConfigTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             model(image="alpine", provider_id="smolvm")
 
-    def test_runner_passthrough_is_derived_from_env_and_keys(self):
+    def test_runner_passthrough_is_derived_from_env_and_secrets(self):
         config = SmolvmConfig(
             image="a",
             env=["GH_TOKEN"],
             environment={"EXTRA": "1"},
-            keys=[{"key_name": "k", "service": "s", "env_var": "APP_KEY"}],
+            secrets=[{"env_var": "APP_KEY", "keychain": "omnigent/app"}],
         )
         names = config.resolved_environment["OMNIGENT_RUNNER_ENV_PASSTHROUGH"].split(",")
         self.assertEqual(names, ["APP_KEY", "GH_TOKEN", "EXTRA"])
@@ -258,7 +362,8 @@ class DynamicPortTests(unittest.TestCase):
     @patch(f"{_MODULE}._port_available", return_value=True)
     def test_allocation_takes_the_lowest_free_ports(self, _available):
         launcher = SmolvmSandboxLauncher(config=self.configure())
-        self.assertEqual(launcher._allocate_ports(), [30000, 30001, 30002])
+        with patch.object(SmolvmSandboxLauncher, "_claimed_ports", return_value=set()):
+            self.assertEqual(launcher._allocate_ports(), [30000, 30001, 30002])
 
     @patch(f"{_MODULE}._port_available")
     def test_allocation_skips_busy_and_claimed_ports(self, available):
@@ -559,22 +664,19 @@ class SmolvmLauncherTests(unittest.TestCase):
 
     @patch(f"{_MODULE}.secrets.token_hex", return_value="aabbccdd")
     @patch(f"{_MODULE}.subprocess.run")
-    def test_secrets_are_absent_from_create_and_machine_record(self, run, _token):
+    def test_create_passes_secret_references_never_values(self, run, _token):
         recorder = Recorder()
         run.side_effect = recorder
-        with patch.object(
-            SmolvmSandboxLauncher, "_keys", return_value={"APP_KEY": "s3cret-value"}
-        ):
-            launcher = SmolvmSandboxLauncher(
-                config=SmolvmConfig(
-                    image="alpine",
-                    keys=[{"key_name": "k", "service": "s", "env_var": "APP_KEY"}],
-                )
+        launcher = SmolvmSandboxLauncher(
+            config=SmolvmConfig(
+                image="alpine",
+                secrets=[{"env_var": "APP_KEY", "keychain": "omnigent/app"}],
             )
-            launcher.provision("session")
-        create_argv = recorder.call_containing("machine create")
-        self.assertNotIn("s3cret-value", " ".join(create_argv))
-        self.assertNotIn("--secret", " ".join(create_argv))
+        )
+        launcher.provision("session")
+        create_argv = " ".join(recorder.call_containing("machine create"))
+        self.assertIn("--secret-keychain APP_KEY=omnigent/app", create_argv)
+        self.assertNotIn("OMNIGENT_SECRET_", create_argv)
 
     # -------------------------------------------------------------------- exec
 
@@ -591,40 +693,30 @@ class SmolvmLauncherTests(unittest.TestCase):
         self.assertIn("-i", argv)
 
     @patch(f"{_MODULE}.subprocess.run")
-    def test_exec_delivers_secrets_per_run_not_in_argv(self, run):
+    def test_exec_carries_no_secret_flags_or_host_env(self, run):
         recorder = Recorder()
         run.side_effect = recorder
-        with patch.object(
-            SmolvmSandboxLauncher, "_keys", return_value={"APP_KEY": "s3cret-value"}
-        ):
-            launcher = SmolvmSandboxLauncher(
-                config=SmolvmConfig(
-                    image="alpine",
-                    keys=[{"key_name": "k", "service": "s", "env_var": "APP_KEY"}],
-                )
+        launcher = SmolvmSandboxLauncher(
+            config=SmolvmConfig(
+                image="alpine",
+                secrets=[{"env_var": "APP_KEY", "keychain": "omnigent/app"}],
             )
-            launcher.run("box", "env | grep APP_KEY")
+        )
+        launcher.run("box", "env | grep APP_KEY")
         argv, kwargs = recorder.calls[-1]
-        joined = " ".join(argv)
-        self.assertIn("--secret-env APP_KEY=OMNIGENT_SECRET_APP_KEY", joined)
-        self.assertNotIn("s3cret-value", joined)
-        self.assertEqual(kwargs["env"]["OMNIGENT_SECRET_APP_KEY"], "s3cret-value")
+        self.assertNotIn("--secret", " ".join(argv))
+        self.assertNotIn("OMNIGENT_SECRET_", " ".join(argv))
+        self.assertFalse([k for k in kwargs["env"] if k.startswith("OMNIGENT_SECRET_")])
 
     @patch(f"{_MODULE}.subprocess.run")
     def test_exec_failure_is_redacted(self, run):
         recorder = Recorder(exec_code=1, exec_stderr="denied value s3cret-value")
         run.side_effect = recorder
-        with patch.object(
-            SmolvmSandboxLauncher, "_keys", return_value={"APP_KEY": "s3cret-value"}
-        ):
-            launcher = SmolvmSandboxLauncher(
-                config=SmolvmConfig(
-                    image="alpine",
-                    keys=[{"key_name": "k", "service": "s", "env_var": "APP_KEY"}],
-                )
-            )
-            with self.assertRaises(click.ClickException) as caught:
-                launcher.run("box", "false")
+        launcher = SmolvmSandboxLauncher(
+            config=SmolvmConfig(image="alpine", environment={"EMBEDDED": "s3cret-value"})
+        )
+        with self.assertRaises(click.ClickException) as caught:
+            launcher.run("box", "false")
         message = str(caught.exception)
         self.assertIn("exit 1", message)
         self.assertNotIn("s3cret-value", message)

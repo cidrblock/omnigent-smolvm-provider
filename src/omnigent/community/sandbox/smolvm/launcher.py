@@ -19,12 +19,11 @@ import socket
 import subprocess
 import sys
 import tempfile
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
 import click
-import keyring
 from omnigent.onboarding.sandboxes.base import (
     ExecModelHostLauncher,
     RemoteCommandResult,
@@ -47,12 +46,6 @@ _WORKSPACE_LABEL = "omnigent.workspace"
 
 #: Where the provider records the host ports it handed this machine.
 _PORTS_LABEL = "omnigent.ports"
-
-#: Prefix for the host-side environment variables that carry a keyring secret to
-#: one ``machine exec``. smolvm resolves ``--secret-env GUEST=HOST`` from the
-#: environment of the process it runs in, so the value crosses on the process
-#: environment and never on argv, in the machine record, or on disk.
-_SECRET_ENV_PREFIX = "OMNIGENT_SECRET_"
 
 #: Upper bound on the CLI output quoted back in a user-facing error.
 _MAX_DETAIL_CHARS = 500
@@ -174,87 +167,6 @@ def _private_directory(path: Path) -> None:
         ) from None
 
 
-def _secret_service_items(bus: object, collection_label: str | None) -> list[object]:
-    """Return the items of one Secret Service collection (or of every one).
-
-    Enumeration is defensive on purpose: a collection can hold a *stale* item
-    path (the item was deleted while the collection index still listed it), and
-    ``get_all_items()`` then raises for that entry, aborting the whole scan.
-
-    :param bus: Open Secret Service bus from ``secretstorage.dbus_init()``.
-    :param collection_label: Exact collection label to search, or ``None``.
-    :returns: Items from the matching, unlocked collections.
-    :raises ValueError: When a named collection is missing or locked.
-    """
-    import secretstorage
-
-    all_collections = list(secretstorage.get_all_collections(bus))
-    if collection_label is None:
-        collections = all_collections
-    else:
-        collections = [c for c in all_collections if c.get_label() == collection_label]
-        if not collections:
-            raise ValueError(f"no keyring collection named {collection_label!r}")
-    items: list[object] = []
-    for collection in collections:
-        if collection.is_locked():
-            if collection_label is None:
-                continue
-            raise ValueError(
-                f"keyring collection {collection_label!r} is locked; unlock it and retry"
-            )
-        try:
-            candidates = list(collection.get_all_items())
-        except Exception:  # noqa: BLE001 — index unreadable: skip this collection
-            continue
-        for item in candidates:
-            try:
-                item.get_label()
-            except Exception:  # noqa: BLE001 — stale item path
-                continue
-            items.append(item)
-    return items
-
-
-def _keyring_description_password(description: str, collection_label: str | None = None) -> str:
-    """Read one item by its visible label, optionally inside a named collection.
-
-    :param description: The item's label, matched exactly.
-    :param collection_label: Collection to search; ``None`` searches every
-        unlocked collection.
-    :returns: The stored secret as text.
-    :raises ValueError: Missing/locked collection, no match, or several matches.
-    """
-    if sys.platform != "linux":
-        raise ValueError("keyring lookups require Linux Secret Service")
-    import secretstorage
-
-    with closing(secretstorage.dbus_init()) as bus:
-        matches = []
-        for item in _secret_service_items(bus, collection_label):
-            try:
-                if item.get_label() == description:
-                    matches.append(item)
-            except Exception:  # noqa: BLE001 — stale item path
-                continue
-        where = f"collection {collection_label!r}" if collection_label else "any collection"
-        if not matches:
-            raise ValueError(f"no keyring item labelled {description!r} in {where}")
-        if len(matches) != 1:
-            raise ValueError(
-                f"keyring item label {description!r} is ambiguous ({len(matches)} matches)"
-            )
-        item = matches[0]
-        if item.is_locked():
-            raise ValueError(f"keyring item {description!r} is locked")
-        return item.get_secret().decode("utf-8")
-
-
-def _keyring_label_password(label: str) -> str:
-    """Read one item by label from any unlocked collection (legacy form)."""
-    return _keyring_description_password(label, None)
-
-
 class SmolvmSandboxLauncher(ExecModelHostLauncher):
     """Provision, exec into, resume, and remove managed smolvm sandboxes."""
 
@@ -263,7 +175,6 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
     def __init__(self, *, config: SmolvmConfig):
         self.config = config
         self.provider = config.provider_id
-        self._key_values: dict[str, str] | None = None
 
     # ------------------------------------------------------------------ state
 
@@ -320,19 +231,17 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
     # ----------------------------------------------------------------- errors
 
     def _secrets(self) -> list[str]:
-        """Values that must never reach a user-facing error message."""
-        values = [
+        """Values this provider knows and must never echo back in an error.
+
+        Secrets themselves are opaque here — smolvm resolves them from the
+        keychain, the host environment, or a file — so this only covers the
+        plain values the config itself carries.
+        """
+        return [
             value
             for name, value in self.config.resolved_environment.items()
-            if name != "OMNIGENT_RUNNER_ENV_PASSTHROUGH" and value
+            if name != "OMNIGENT_RUNNER_ENV_PASSTHROUGH" and value and len(value) >= 6
         ]
-        try:
-            values.extend(self._keys().values())
-        except click.ClickException:
-            # A keyring miss is reported on its own path; the error we are
-            # building must not turn into a different failure.
-            pass
-        return [value for value in values if len(value) >= 6]
 
     def _failed(
         self, action: str, result: subprocess.CompletedProcess[str]
@@ -340,56 +249,6 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
         """Build an error that says what failed *and* why smolvm failed."""
         detail = _error_detail(result, self._secrets())
         return click.ClickException(f"{action}: {detail}" if detail else action)
-
-    # ----------------------------------------------------------------- secrets
-
-    def _keys(self) -> dict[str, str]:
-        """Read each requested credential without exporting it on the host."""
-        if self._key_values is not None:
-            return self._key_values
-        values: dict[str, str] = {}
-        for key in self.config.keys:
-            try:
-                if key.description is not None:
-                    value = _keyring_description_password(key.description, key.keyring)
-                elif key.item_label is not None:
-                    value = _keyring_label_password(key.item_label)
-                else:
-                    assert key.key_name is not None  # validated by KeyringKey
-                    value = keyring.get_password(key.service, key.key_name)
-            except Exception as exc:
-                # The message stays generic on purpose: keyring backends echo
-                # lookups and paths, and this string reaches the UI/logs.
-                _LOGGER.debug(
-                    "keyring lookup failed for %s: %s: %s",
-                    key.env_var,
-                    type(exc).__name__,
-                    exc,
-                )
-                raise click.ClickException(
-                    f"Cannot read keyring entry for {key.env_var}"
-                ) from None
-            if not value or "\x00" in value:
-                raise click.ClickException(
-                    f"Missing or invalid keyring entry for {key.env_var}"
-                )
-            values[key.env_var] = value
-        self._key_values = values
-        return values
-
-    def _secret_arguments(self) -> tuple[list[str], dict[str, str]]:
-        """Return ``--secret-env`` references and the environment they resolve from.
-
-        smolvm reads the host variable when the exec starts, so a rotated secret
-        is picked up by the next command instead of requiring a machine restart.
-        """
-        args: list[str] = []
-        environment: dict[str, str] = {}
-        for name, value in self._keys().items():
-            host_var = f"{_SECRET_ENV_PREFIX}{name}"
-            args.extend(["--secret-env", f"{name}={host_var}"])
-            environment[host_var] = value
-        return args, environment
 
     # ------------------------------------------------------------------ config
 
@@ -456,7 +315,6 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
                 raise click.ClickException(
                     f"smolvm mount source is not readable by this user: {mount.source}"
                 )
-        self._keys()
 
     def _workspace_directory(self, safe_name: str) -> Path | None:
         """Create and return this sandbox's private workspace, if configured."""
@@ -525,7 +383,10 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
             args.append("--block-private")
         if config.outbound_localhost_only:
             args.append("--outbound-localhost-only")
+        for secret in config.secrets:
+            args.extend(secret.arguments())
         for binding in config.credentials:
+            args.extend(binding.source_arguments())
             args.extend(["--credential", binding.render()])
         for mapping in config.ports:
             args.extend(["--port", mapping])
@@ -557,7 +418,6 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
 
     def provision(self, name: str) -> str:
         """Create and start a machine, returning its name as the sandbox id."""
-        self._keys()
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-.")[:48] or "session"
         machine_name = f"omni-{safe_name}-{secrets.token_hex(4)}"
         workspace = self._workspace_directory(safe_name)
@@ -856,20 +716,17 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
         server starts the managed host through this method, and its launch token
         would otherwise be visible in the host's process list.
         """
-        secret_args, secret_env = self._secret_arguments()
         script = command if command.endswith("\n") else f"{command}\n"
         result = self._smolvm(
             "machine",
             "exec",
             "-i",
-            *secret_args,
             "--name",
             sandbox_id,
             "--",
             "sh",
             "-s",
             sandbox_id=sandbox_id,
-            env=secret_env,
             input=script,
             timeout=None,
         )

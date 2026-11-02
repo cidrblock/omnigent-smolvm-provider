@@ -37,8 +37,20 @@ sandbox:
              target: /root/.omnigent-sandbox, mode: ro}
         init:
           - cp -a /root/.omnigent-sandbox/. / && chown -R root:root /root/workspace
-        keys:
-          - {keyring: Agents, description: github, env_var: GH_TOKEN}
+        # References only: smolvm reads each value on the host at machine
+        # start. keychain items are `secret-tool lookup service omnigent
+        # account <name>`; env:/file: are the other two sources.
+        secrets:
+          - {env_var: GH_TOKEN, keychain: omnigent/github}
+          - {env_var: GIT_TOKEN, keychain: omnigent/github}
+        # Forward the host's SSH agent instead of mounting keys.
+        ssh_agent: false
+        # Keep a value out of the guest entirely: the host substitutes it into
+        # a header for these hosts only. The host must also pass the egress
+        # policy above.
+        # credentials:
+        #   - {name: jira, env_var: JIRA_TOKEN, keychain: omnigent/jira,
+        #      hosts: ["api.atlassian.com"]}
         agent_workspace: true
         agent_workspace_root: /home/me/agent_work
         # Not set on purpose: a per-sandbox state dir re-imports the image for

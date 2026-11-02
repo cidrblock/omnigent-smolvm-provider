@@ -77,15 +77,54 @@ smolvm unless the profile raises `--max-image-size`.
     dynamic_port_count: 10
     mounts:
       - {source: /home/me/repo, target: /root/workspace, mode: rw}
-    keys:
-      - {keyring: Agents, description: github, env_var: GH_TOKEN}
+    # Secrets are references, never values: smolvm resolves each one on the
+    # host at machine start and puts it in the guest environment.
+    secrets:
+      - {env_var: GH_TOKEN, keychain: omnigent/github}
+    ssh_agent: false
     agent_workspace: true
     agent_workspace_root: /home/me/agent_work
 ```
 
-Every secret is resolved on the host at exec time and delivered with
-`--secret-env`, so the value never appears in the machine record, the Smolfile,
-a log, or the process argv.
+## Secrets
+
+Nothing secret is held by this provider. Each `secrets:` entry names where the
+value lives and the provider writes only that reference to `machine create`:
+
+| Config | Flag | Where the value lives |
+|---|---|---|
+| `{env_var: X, keychain: service/account}` | `--secret-keychain X=service/account` | host keychain (`secret-tool` on Linux) |
+| `{env_var: X, env: HOST_VAR}` | `--secret-env X=HOST_VAR` | this host's environment |
+| `{env_var: X, file: /abs/path}` | `--secret-file X=/abs/path` | a host file |
+
+smolvm resolves them at every machine start, so a rotated value takes effect
+on the next start, not on the next `exec`. A missing keychain item fails the
+start with `keychain_item_missing`.
+
+### Brokered credentials
+
+`credentials:` keeps a secret out of the guest entirely. smolvm terminates TLS
+for the listed hosts on the host side, substitutes the real value into a header,
+and refuses it anywhere else; the guest holds an opaque placeholder.
+
+```yaml
+    allow_host_patterns: ["*.atlassian.com"]
+    credentials:
+      - name: jira
+        env_var: JIRA_TOKEN
+        hosts: ["api.atlassian.com"]
+        keychain: omnigent/jira   # or env:/file:; omit to read the host var
+        set_header: Authorization # optional: set the header outright
+```
+
+The host must also be reachable by the machine's egress policy — smolvm refuses
+the launch otherwise, and the config validator says so before it gets that far.
+
+### SSH agent
+
+`ssh_agent: true` forwards the host's agent into the guest, so `git` and `ssh`
+use the host keys without copying them in. The host needs `SSH_AUTH_SOCK` set
+when the machine is created.
 
 ## Ports are machine-global
 
@@ -166,7 +205,7 @@ Machines started outside the unit's cgroup are unaffected.
 
 ## Deliberate omissions
 
-`smolvm` supports credentials brokered at the gateway (`--credential`),
-checkpoints, branching, and named inter-VM networks. This provider does not use
-them yet; the profile schema is intentionally small and validators reject
-anything it cannot honour.
+`smolvm` also supports mediated egress (`--mediated-egress` with an
+`--egress-interceptor` decider), checkpoints, branching, and named inter-VM
+networks. This provider does not use them; the profile schema is intentionally
+small and validators reject anything it cannot honour.

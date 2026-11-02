@@ -19,6 +19,22 @@ _PORT_MAP = re.compile(r"(\d{1,5})(?:-(\d{1,5}))?:(\d{1,5})(?:-(\d{1,5}))?(?:/ud
 MAX_PORT_MAPPINGS = 64
 
 
+def _pattern_covers(pattern: str, host: str) -> bool:
+    """Whether ``allow_host_patterns`` entry *pattern* admits *host*.
+
+    smolvm accepts an exact name or ``*.domain`` subdomains only, so a
+    wildcard does not cover its own apex.
+    """
+    if pattern.startswith("*."):
+        return host.endswith(pattern[1:]) and host != pattern[2:]
+    return host == pattern
+
+
+def _name_covers(name: str, host: str) -> bool:
+    """Whether an ``allow_hosts`` entry admits *host* — the apex or below it."""
+    return host == name or host.endswith(f".{name}")
+
+
 def _concrete_mappings(mapping: str) -> int:
     """Return how many host ports one ``HOST[-END]:GUEST[-END]`` entry maps."""
     match = _PORT_MAP.fullmatch(mapping)
@@ -79,30 +95,96 @@ class BindMount(BaseModel):
         return self
 
 
-class KeyringKey(BaseModel):
-    """Map a host keyring credential to a guest process variable.
+class SecretMount(BaseModel):
+    """A value smolvm resolves on the host and hands to the guest env.
 
-    Three lookup shapes, most specific first:
+    Exactly one source, each mapping to one smolvm flag:
 
-    - ``keyring`` + ``description`` — an item whose label is ``description``
-      inside the Secret Service collection named ``keyring``.
-    - ``item_label`` — an item label in the default collection (legacy form).
-    - ``key_name`` + ``service`` — the ``keyring`` module's service/account
-      lookup, the most portable shape.
+    - ``keychain: "service/account"`` → ``--secret-keychain VAR=service/account``
+      (Linux reads it with ``secret-tool lookup service … account …``,
+      macOS with ``security find-generic-password``).
+    - ``env: HOST_VAR`` → ``--secret-env VAR=HOST_VAR``.
+    - ``file: /abs/path`` → ``--secret-file VAR=/abs/path``.
 
-    The value is resolved on the host for each exec and handed to smolvm as a
-    ``--secret-env`` reference, so it never reaches argv, the machine record,
-    or an error message.
+    The provider never reads the value: it only writes the reference, so a
+    secret cannot reach this process's argv, its environment, a log line, or
+    the machine record. smolvm resolves it at every machine start.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    key_name: str | None = Field(default=None, min_length=1)
     env_var: str
-    service: str = Field(default="omnigent-smolvm-provider", min_length=1)
-    item_label: str | None = Field(default=None, min_length=1)
-    keyring: str | None = Field(default=None, min_length=1)
-    description: str | None = Field(default=None, min_length=1)
+    keychain: str | None = Field(default=None, min_length=1)
+    env: str | None = Field(default=None, min_length=1)
+    file: str | None = Field(default=None, min_length=1)
+
+    @field_validator("env_var")
+    @classmethod
+    def validate_env_var(cls, name: str) -> str:
+        if not _ENV_NAME.fullmatch(name):
+            raise ValueError("env_var must be an environment variable name")
+        return name
+
+    @field_validator("keychain")
+    @classmethod
+    def validate_keychain(cls, item: str | None) -> str | None:
+        """smolvm accepts ``SERVICE`` or ``SERVICE/ACCOUNT``, both non-empty."""
+        if item is None:
+            return None
+        service, _, account = item.partition("/")
+        if not service or (item.endswith("/") and item != service):
+            raise ValueError("keychain must be SERVICE or SERVICE/ACCOUNT, neither part empty")
+        if any(character in item for character in "\r\n\x00"):
+            raise ValueError("keychain item cannot contain control characters")
+        return item
+
+    @field_validator("file")
+    @classmethod
+    def validate_file(cls, path: str | None) -> str | None:
+        if path is None:
+            return None
+        if not PurePosixPath(path).is_absolute() or ".." in path.split("/"):
+            raise ValueError("file must be an absolute path without '..'")
+        return path
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "SecretMount":
+        given = [name for name in ("keychain", "env", "file") if getattr(self, name)]
+        if len(given) != 1:
+            raise ValueError("a secret needs exactly one of keychain, env, or file")
+        return self
+
+    def arguments(self) -> list[str]:
+        """Render the smolvm flags for this secret (value never included)."""
+        if self.keychain is not None:
+            return ["--secret-keychain", f"{self.env_var}={self.keychain}"]
+        if self.env is not None:
+            return ["--secret-env", f"{self.env_var}={self.env}"]
+        return ["--secret-file", f"{self.env_var}={self.file}"]
+
+
+class CredentialBinding(BaseModel):
+    """A gateway-brokered credential the guest may use but never read.
+
+    ``hosts`` are the only destinations a substituted value is released to.
+    smolvm terminates TLS for those hosts on the host side, injects the secret
+    into a request header, and refuses it anywhere else — the guest holds only
+    an opaque placeholder.
+
+    ``keychain``/``env``/``file`` name where the real value comes from, and are
+    emitted as a secret reference for ``env_var``. With none of them smolvm
+    falls back to the host environment variable of the same name.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    env_var: str
+    hosts: list[str] = Field(min_length=1)
+    set_header: str | None = None
+    keychain: str | None = Field(default=None, min_length=1)
+    env: str | None = Field(default=None, min_length=1)
+    file: str | None = Field(default=None, min_length=1)
 
     @field_validator("env_var")
     @classmethod
@@ -112,27 +194,28 @@ class KeyringKey(BaseModel):
         return name
 
     @model_validator(mode="after")
-    def validate_lookup(self) -> "KeyringKey":
-        if self.keyring is not None and self.description is None:
-            raise ValueError("keyring requires a description (the item label)")
-        if self.key_name is None and self.item_label is None and self.description is None:
-            raise ValueError("one of key_name, item_label, or description is required")
+    def validate_source(self) -> "CredentialBinding":
+        given = [name for name in ("keychain", "env", "file") if getattr(self, name)]
+        if len(given) > 1:
+            raise ValueError("a credential takes at most one of keychain, env, or file")
+        if (self.keychain or self.env or self.file) is not None:
+            SecretMount.model_validate(
+                {
+                    "env_var": self.env_var,
+                    "keychain": self.keychain,
+                    "env": self.env,
+                    "file": self.file,
+                }
+            )
         return self
 
-
-class CredentialBinding(BaseModel):
-    """A gateway-brokered credential the guest may use but never read.
-
-    ``hosts`` are the only destinations a substituted value is released to.
-    smolvm injects it into an HTTPS request header and refuses it anywhere else.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    env_var: str
-    hosts: list[str] = Field(min_length=1)
-    set_header: str | None = None
+    def source_arguments(self) -> list[str]:
+        """The secret reference that feeds this credential, if one was declared."""
+        if not (self.keychain or self.env or self.file):
+            return []
+        return SecretMount(
+            env_var=self.env_var, keychain=self.keychain, env=self.env, file=self.file
+        ).arguments()
 
     @field_validator("name", "env_var")
     @classmethod
@@ -218,7 +301,10 @@ class SmolvmConfig(BaseModel):
     env: list[str] = Field(default_factory=list)
     environment: dict[str, str] = Field(default_factory=dict)
     mounts: list[BindMount] = Field(default_factory=list)
-    keys: list[KeyringKey] = Field(default_factory=list)
+    secrets: list[SecretMount] = Field(default_factory=list)
+    #: Forward this host's SSH agent into the guest, so git and ssh use the
+    #: host's keys without copying them in. smolvm passes the socket through at
+    #: launch, which also means the host must have ``SSH_AUTH_SOCK`` set.
     ssh_agent: bool = False
     user: str | None = None
     workdir: str | None = None
@@ -414,15 +500,40 @@ class SmolvmConfig(BaseModel):
         return mounts
 
     @model_validator(mode="after")
-    def validate_keys(self) -> "SmolvmConfig":
-        names = [key.env_var for key in self.keys]
+    def validate_secrets(self) -> "SmolvmConfig":
+        names = [secret.env_var for secret in self.secrets]
         if len(names) != len(set(names)):
-            raise ValueError("keyring env_var names must be unique")
+            raise ValueError("secret env_var names must be unique")
         if set(names) & set(self.env) or set(names) & set(self.environment):
-            raise ValueError("keyring env_var names cannot also appear in env or environment")
-        brokered = [binding.env_var for binding in self.credentials]
-        if set(brokered) & set(names):
-            raise ValueError("a credential env_var cannot also be a keyring env_var")
+            raise ValueError("secret env_var names cannot also appear in env or environment")
+        own = [binding.env_var for binding in self.credentials if binding.source_arguments()]
+        if set(own) & set(names):
+            raise ValueError(
+                "a credential with its own keychain/env/file source cannot also "
+                "appear in secrets; declare the source once, on the credential"
+            )
+        if len(own) != len(set(own)):
+            raise ValueError("two credentials cannot share a secret env_var")
+        return self
+
+    @model_validator(mode="after")
+    def validate_credential_hosts_are_reachable(self) -> "SmolvmConfig":
+        """A brokered host must also be reachable, or the machine will not start.
+
+        smolvm refuses the launch with ``credential "x" host "y" is not
+        reachable under the machine's network allow_hosts``; catching it here
+        turns that into a config error an operator can read.
+        """
+        for binding in self.credentials:
+            for host in binding.hosts:
+                if any(_name_covers(name, host) for name in self.allow_hosts):
+                    continue
+                if any(_pattern_covers(pattern, host) for pattern in self.allow_host_patterns):
+                    continue
+                raise ValueError(
+                    f"credential {binding.name!r} targets {host!r}, which no "
+                    "allow_hosts or allow_host_patterns entry admits"
+                )
         return self
 
     @model_validator(mode="after")
@@ -498,7 +609,7 @@ class SmolvmConfig(BaseModel):
             name.strip() for name in env.get(passthrough_name, "").split(",") if name.strip()
         ]
         derived = (
-            [key.env_var for key in self.keys]
+            [secret.env_var for secret in self.secrets]
             + [binding.env_var for binding in self.credentials]
             + list(self.env)
             + [name for name in env if name != passthrough_name]
