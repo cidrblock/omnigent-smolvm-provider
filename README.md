@@ -7,17 +7,50 @@ no daemon, and no container engine in the trust path.
 
 ## Why a microVM
 
-The Podman provider fences a container's network namespace with an OCI hook and
-limits what the in-container agent can reach with `cap_drop` and pasta. Both are
-policy *inside* the workload's own control: the agent can start its own engine,
-and `podman build` never runs the hook at all. A microVM moves the boundary out
-of the workload — the guest cannot edit the host-side egress gateway, and a
-container the agent starts inside the guest is still inside the same boundary.
+A container-based sandbox fences the container's network namespace with a hook in
+the host's container engine, and limits what the agent can reach with capability
+drops and a mapped network. Both are policy *inside* the workload's own engine:
+the agent can start its own engine, and a build never runs the hook at all. A
+microVM moves the boundary out of the workload — the guest cannot edit the
+host-side egress gateway, and a container the agent starts inside the guest is
+still inside the same boundary.
 
 ## Requirements
 
 - `smolvm` on `PATH` (or `binary:` pointing at it)
 - Linux with `/dev/kvm`, or macOS 11+ on Apple Silicon, or Windows with WHP
+
+## Install
+
+The provider is a normal Python package that registers itself through the
+`omnigent.sandbox_providers` entry-point group, so it has to be installed into
+the same environment as the Omnigent CLI:
+
+```bash
+uv pip install --python ~/.local/share/uv/tools/omnigent/bin/python \
+  git+https://github.com/cidrblock/omnigent-smolvm-provider
+```
+
+For development, clone it and install it editable instead:
+
+```bash
+git clone https://github.com/cidrblock/omnigent-smolvm-provider
+uv pip install --python ~/.local/share/uv/tools/omnigent/bin/python \
+  -e omnigent-smolvm-provider
+```
+
+A forced `uv tool install`/`upgrade` of Omnigent rebuilds the venv and drops the
+provider with it; reinstall after any upgrade. The server picks providers up at
+startup, so restart it, then check that `GET /v1/info` lists `smolvm` under
+`sandbox_providers`.
+
+Tests (they stub `smolvm`, no VM is started):
+
+```bash
+cd omnigent-smolvm-provider
+uv pip install --python ~/.local/share/uv/tools/omnigent/bin/python -e '.[dev]'
+python -m pytest -q
+```
 
 ## Reaching the server from the guest
 
@@ -51,8 +84,9 @@ rootfs directory. A locally built image is reachable without a registry:
 
 ```bash
 podman save --format docker-archive \
-  -o ~/.omnigent/sandbox/smolvm/omnigent-host-fedora-1.tar \
-  localhost/omnigent-host:fedora-1
+  -o /var/lib/images/omnigent-host.tar \
+  localhost/omnigent-host:latest
+# or: docker save -o /var/lib/images/omnigent-host.tar localhost/omnigent-host:latest
 ```
 
 then set `image:` to that path. The image must contain the `omnigent` CLI —
@@ -145,7 +179,7 @@ with none:
 - provider: smolvm-ui
   server_url: http://100.96.0.1:6767
   smolvm-ui:
-    image: /home/me/.omnigent/sandbox/smolvm/omnigent-host-fedora-1.tar
+    image: /var/lib/images/omnigent-host.tar
     net_backend: virtio-net
     ports: ["8081:8080"]      # one at a time, by design
 ```

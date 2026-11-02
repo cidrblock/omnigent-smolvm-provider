@@ -9,8 +9,8 @@ sandbox:
       server_url: http://100.96.0.1:6767
       smolvm-default:
         # A `docker save` archive of an image with the omnigent CLI in it, or a
-        # registry reference such as ghcr.io/you/omnigent-host:fedora-1.
-        image: /home/me/.omnigent/sandbox/smolvm/omnigent-host-fedora-1.tar
+        # registry reference such as ghcr.io/you/omnigent-host:latest.
+        image: /home/me/images/omnigent-host.tar
         cpus: 4
         memory_mib: 8192
         net_backend: virtio-net

@@ -13,12 +13,13 @@ dependencies = [
   "omnigent>=0.19.1,<0.21",
   "pydantic>=2",
   "PyYAML>=6",
-  "keyring>=25,<27",
-  "secretstorage>=3.2; sys_platform == 'linux'",
 ]
 
 [project.entry-points."omnigent.sandbox_providers"]
 smolvm = "omnigent.community.sandbox.smolvm.plugin:get_contribution"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
