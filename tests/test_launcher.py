@@ -120,6 +120,22 @@ class SmolvmConfigTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 SmolvmConfig(image="a", allow_cidrs=[bad])
 
+    def test_allow_private_reuses_cidr_validation(self):
+        config = SmolvmConfig(image="a", block_private=True, allow_private=["100.96.0.0/30"])
+        self.assertEqual(config.allow_private, ["100.96.0.0/30"])
+        for bad in ("100.96.0.1", "$(id)", "not-a-cidr"):
+            with self.assertRaises(ValidationError):
+                SmolvmConfig(image="a", allow_private=[bad])
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(image="a", allow_private=["10.0.0.0/8", "10.0.0.0/8"])
+
+    def test_guest_subnet_must_be_a_small_ipv4_link_network(self):
+        config = SmolvmConfig(image="a", guest_subnet="100.96.0.0/30")
+        self.assertEqual(config.guest_subnet, "100.96.0.0/30")
+        for bad in ("0.0.0.0/0", "100.96.0.0/31", "fd00::/120", "100.96.0.0", "100.96.0.1/30"):
+            with self.assertRaises(ValidationError):
+                SmolvmConfig(image="a", guest_subnet=bad)
+
     def test_port_ranges_must_be_one_to_one(self):
         SmolvmConfig(image="a", ports=["8080:80", "9000-9002:9000-9002", "7000:7000/udp"])
         for bad in ("8080", "8080:80:90", "9000-9002:9100", "0:80", "65536:80",
@@ -310,7 +326,10 @@ class SmolvmLauncherTests(unittest.TestCase):
                     allow_host_patterns=["*.example.com"],
                     allow_cidrs=["192.0.2.0/24"],
                     deny_cidrs=["10.0.0.0/8"],
+                    allow_private=["100.96.0.0/30"],
+                    guest_subnet="100.96.0.0/30",
                     block_private=True,
+                    net_backend="virtio-net",
                     environment={"EXTRA": "value"},
                     mounts=[BindMount(source=Path(directory), target="/data", mode="ro")],
                     init=["apk add curl"],
@@ -334,6 +353,8 @@ class SmolvmLauncherTests(unittest.TestCase):
         self.assertIn("--allow-host-pattern *.example.com", joined)
         self.assertIn("--allow-cidr 192.0.2.0/24", joined)
         self.assertIn("--deny-cidr 10.0.0.0/8", joined)
+        self.assertIn("--allow-private 100.96.0.0/30", joined)
+        self.assertIn("--guest-subnet 100.96.0.0/30", joined)
         self.assertIn("--block-private", joined)
         self.assertIn(f"-v {directory}:/data:ro", joined)
         self.assertIn("--init", joined)

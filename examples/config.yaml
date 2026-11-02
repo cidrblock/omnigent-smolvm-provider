@@ -3,22 +3,30 @@
 sandbox:
   providers:
     - provider: smolvm-default
-      server_url: http://127.0.0.1:6767
+      # The managed host reaches the server through the guest gateway, which
+      # only exists on virtio-net. `block_private` closes CGNAT too, so the
+      # gateway subnet has to be re-opened explicitly.
+      server_url: http://100.96.0.1:6767
       smolvm-default:
-        image: alpine:3.20
+        # A `docker save` archive of an image with the omnigent CLI in it, or a
+        # registry reference such as ghcr.io/you/omnigent-host:fedora-1.
+        image: /home/me/.omnigent/sandbox/smolvm/omnigent-host-fedora-1.tar
         cpus: 4
         memory_mib: 8192
+        net_backend: virtio-net
+        block_private: true
+        allow_private: ["100.96.0.0/30"]
         # Host-to-guest slots. Agents can serve anything inside the guest and
         # relay it onto one of these; add more here if you need more at once.
         ports: ["8080:8080", "3000:3000"]
         allow_hosts: ["api.github.com"]
         allow_host_patterns: ["*.example.com"]
-        block_private: true
         mounts:
           - {source: /home/me/repo, target: /root/repo, mode: rw}
         keys:
           - {keyring: Agents, description: github, env_var: GH_TOKEN}
         agent_workspace: true
         agent_workspace_root: /home/me/agent_work
-        # Each sandbox gets its own smolvm store, at the cost of one image pull.
-        state_dir_root: /home/me/.local/share/omnigent/smolvm
+        # Not set on purpose: a per-sandbox state dir re-imports the image for
+        # every machine. Set it only when stronger isolation is worth that.
+        # state_dir_root: /home/me/.local/share/omnigent/smolvm

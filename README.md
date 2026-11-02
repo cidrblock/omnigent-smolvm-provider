@@ -19,6 +19,46 @@ container the agent starts inside the guest is still inside the same boundary.
 - `smolvm` on `PATH` (or `binary:` pointing at it)
 - Linux with `/dev/kvm`, or macOS 11+ on Apple Silicon, or Windows with WHP
 
+## Reaching the server from the guest
+
+The Omnigent server listens on host loopback, so the managed host needs a path
+back out of the guest. `--net-backend virtio-net` gives the guest a link whose
+first address is the host, and that address reaches host loopback:
+
+```yaml
+server_url: http://100.96.0.1:6767   # gateway of the default 100.96.0.0/30
+net_backend: virtio-net
+```
+
+That gateway is in CGNAT space, which `block_private` also closes, so a fenced
+profile has to re-open exactly that subnet:
+
+```yaml
+block_private: true
+allow_private: ["100.96.0.0/30"]
+```
+
+Measured result of that pair: the gateway and the public internet are
+reachable, and the host's LAN is not. With `tsi` (the default backend) the
+gateway path does not exist and guest loopback is the guest's own. `guest_subnet`
+pins the link subnet if `100.96.0.0/30` collides with a VPN on the host; the
+gateway is always the first address of whatever subnet you pick.
+
+## Images
+
+`image:` takes a registry reference, a `docker save` archive, or an unpacked
+rootfs directory. A locally built image is reachable without a registry:
+
+```bash
+podman save --format docker-archive \
+  -o ~/.omnigent/sandbox/smolvm/omnigent-host-fedora-1.tar \
+  localhost/omnigent-host:fedora-1
+```
+
+then set `image:` to that path. The image must contain the `omnigent` CLI —
+the server starts the managed host through it. Archives are capped at 8 GiB by
+smolvm unless the profile raises `--max-image-size`.
+
 ## Configuration
 
 ```yaml
@@ -28,9 +68,11 @@ container the agent starts inside the guest is still inside the same boundary.
     cpus: 4
     memory_mib: 8192
     ports: ["8080:8080"]
+    net_backend: virtio-net
     allow_hosts: ["api.github.com"]
     allow_host_patterns: ["*.example.com"]
     block_private: true
+    allow_private: ["100.96.0.0/30"]
     mounts:
       - {source: /home/me/repo, target: /root/workspace, mode: rw}
     keys:

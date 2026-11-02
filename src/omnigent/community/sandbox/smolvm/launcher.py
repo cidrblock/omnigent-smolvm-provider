@@ -477,6 +477,10 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
             args.extend(["--allow-cidr", cidr])
         for cidr in config.deny_cidrs:
             args.extend(["--deny-cidr", cidr])
+        for cidr in config.allow_private:
+            args.extend(["--allow-private", cidr])
+        if config.guest_subnet is not None:
+            args.extend(["--guest-subnet", config.guest_subnet])
         if config.block_private:
             args.append("--block-private")
         if config.outbound_localhost_only:

@@ -177,6 +177,13 @@ class SmolvmConfig(BaseModel):
     allow_host_patterns: list[str] = Field(default_factory=list)
     allow_cidrs: list[str] = Field(default_factory=list)
     deny_cidrs: list[str] = Field(default_factory=list)
+    #: Re-open one otherwise-blocked range under ``block_private``. The managed
+    #: host reaches the Omnigent server through the guest gateway, which lives
+    #: in CGNAT space, so a fenced profile must re-open that subnet.
+    allow_private: list[str] = Field(default_factory=list)
+    #: Pin the guest link subnet. Its first address is the gateway, which is
+    #: where the guest reaches host loopback; the second is the guest itself.
+    guest_subnet: str | None = None
     #: Close the LAN, cloud metadata, CGNAT, and the host's loopback while the
     #: public internet stays open.
     block_private: bool = False
@@ -242,14 +249,31 @@ class SmolvmConfig(BaseModel):
             )
         return patterns
 
-    @field_validator("allow_cidrs", "deny_cidrs")
+    @field_validator("allow_cidrs", "deny_cidrs", "allow_private")
     @classmethod
     def validate_cidrs(cls, cidrs: list[str]) -> list[str]:
         if len(cidrs) != len(set(cidrs)):
             raise ValueError("CIDR entries must be unique")
         for cidr in cidrs:
+            if "/" not in cidr:
+                raise ValueError(f"CIDR entry needs an explicit prefix length: {cidr!r}")
             _network(cidr, "CIDR")
         return cidrs
+
+    @field_validator("guest_subnet")
+    @classmethod
+    def validate_guest_subnet(cls, subnet: str | None) -> str | None:
+        """Require a small IPv4 link subnet the gateway and guest can share."""
+        if subnet is None:
+            return None
+        network = ipaddress.ip_network(subnet, strict=True) if "/" in subnet else None
+        if network is None or not isinstance(network, ipaddress.IPv4Network):
+            raise ValueError("guest_subnet must be an IPv4 CIDR, e.g. 100.96.0.0/30")
+        if not 8 <= network.prefixlen <= 30:
+            raise ValueError(
+                "guest_subnet must be between /8 and /30 (gateway plus guest)"
+            )
+        return subnet
 
     @field_validator("ports")
     @classmethod
@@ -396,6 +420,8 @@ class SmolvmConfig(BaseModel):
             or self.allow_host_patterns
             or self.allow_cidrs
             or self.deny_cidrs
+            or self.allow_private
+            or self.guest_subnet is not None
             or self.block_private
             or self.outbound_localhost_only
             or self.credentials
