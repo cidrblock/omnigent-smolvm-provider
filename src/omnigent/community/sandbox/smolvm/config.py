@@ -19,6 +19,16 @@ _PORT_MAP = re.compile(r"(\d{1,5})(?:-(\d{1,5}))?:(\d{1,5})(?:-(\d{1,5}))?(?:/ud
 MAX_PORT_MAPPINGS = 64
 
 
+def _concrete_mappings(mapping: str) -> int:
+    """Return how many host ports one ``HOST[-END]:GUEST[-END]`` entry maps."""
+    match = _PORT_MAP.fullmatch(mapping)
+    if match is None:
+        return 1
+    start = int(match.group(1))
+    end = int(match.group(2) or start)
+    return max(end - start + 1, 1)
+
+
 def _network(value: str, field: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
     """Parse *value* as a CIDR, rejecting anything a shell could reinterpret."""
     try:
@@ -197,6 +207,14 @@ class SmolvmConfig(BaseModel):
     #: publish from a per-session alias instead.
     ports: list[str] = Field(default_factory=list)
 
+    #: Give every sandbox its own slice of host ports. The provider picks
+    #: ``dynamic_port_count`` free ports inside ``dynamic_port_range`` at
+    #: provision time and maps each one to the same guest port, so concurrent
+    #: sandboxes never contend for a host port. The allocation is written into
+    #: the guest's sandbox file and onto the machine's labels.
+    dynamic_port_range: tuple[int, int] | None = None
+    dynamic_port_count: int = Field(default=0, ge=0, le=MAX_PORT_MAPPINGS)
+
     env: list[str] = Field(default_factory=list)
     environment: dict[str, str] = Field(default_factory=dict)
     mounts: list[BindMount] = Field(default_factory=list)
@@ -276,6 +294,38 @@ class SmolvmConfig(BaseModel):
                 "guest_subnet must be between /8 and /30 (gateway plus guest)"
             )
         return subnet
+
+    @model_validator(mode="after")
+    def validate_dynamic_ports(self) -> "SmolvmConfig":
+        """Require a range exactly when a count is asked for."""
+        if self.dynamic_port_count and self.dynamic_port_range is None:
+            raise ValueError("dynamic_port_count requires dynamic_port_range")
+        if self.dynamic_port_range is None:
+            if self.dynamic_port_count:
+                raise ValueError("dynamic_port_count requires dynamic_port_range")
+            return self
+        start, end = self.dynamic_port_range
+        if not 1024 <= start <= end <= 65535:
+            raise ValueError("dynamic_port_range must be two ports between 1024 and 65535")
+        if not self.dynamic_port_count:
+            raise ValueError("dynamic_port_range requires dynamic_port_count")
+        if self.dynamic_port_count > end - start + 1:
+            raise ValueError("dynamic_port_count exceeds the dynamic_port_range size")
+        fixed = sum(_concrete_mappings(mapping) for mapping in self.ports)
+        if fixed + self.dynamic_port_count > MAX_PORT_MAPPINGS:
+            raise ValueError(
+                f"fixed plus dynamic ports exceed smolvm's {MAX_PORT_MAPPINGS} mappings"
+            )
+        return self
+
+    @field_validator("dynamic_port_range")
+    @classmethod
+    def validate_dynamic_range(
+        cls, value: tuple[int, int] | None
+    ) -> tuple[int, int] | None:
+        if value is not None and value[0] > value[1]:
+            raise ValueError("dynamic_port_range start must not exceed its end")
+        return value
 
     @field_validator("ports")
     @classmethod
@@ -424,6 +474,7 @@ class SmolvmConfig(BaseModel):
             or self.deny_cidrs
             or self.allow_private
             or self.guest_subnet is not None
+            or self.dynamic_port_count > 0
             or self.block_private
             or self.outbound_localhost_only
             or self.credentials

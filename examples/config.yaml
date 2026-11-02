@@ -16,15 +16,18 @@ sandbox:
         net_backend: virtio-net
         block_private: true
         allow_private: ["100.96.0.0/30"]
-        # No ports here. A published host port is machine-global: smolvm will
-        # not start a second machine on a port a running one already holds, so
-        # two sandboxes from this profile would exclude each other. Publish
-        # from a separate alias instead:
-        #   - provider: smolvm-ui
-        #     server_url: http://100.96.0.1:6767
-        #     smolvm-ui: {image: ..., net_backend: virtio-net, ports: ["8081:8080"]}
+        # A published host port is machine-global: smolvm will not start a
+        # second machine on a port a running one already holds. Do not declare
+        # `ports:` on a shared profile; ask for a per-session slice instead and
+        # the provider picks free ports at provision time. Both keys go
+        # together, and host port == guest port for each one.
+        dynamic_port_range: [30000, 40000]
+        dynamic_port_count: 10
+        # The L7 policy: hostnames, resolved in the host-side network stack.
+        # Unlisted names do not resolve and bare IPs have no route. `*.d` does
+        # not cover the apex, so a domain usually needs both forms.
         allow_hosts: ["api.github.com"]
-        allow_host_patterns: ["*.example.com"]
+        allow_host_patterns: ["pypi.org", "*.pypi.org"]
         # smolvm mounts directories only. Single files (AGENTS.md, gitconfig,
         # ssh keys) are staged into one directory and copied over / once, on
         # the machine's first start.

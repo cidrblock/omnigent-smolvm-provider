@@ -53,7 +53,8 @@ class Recorder:
     """Stand-in for ``subprocess.run`` that answers by subcommand."""
 
     def __init__(self, *, state="running", labels=None, create_code=0, start_code=0,
-                 exec_code=0, exec_stdout="", exec_stderr="", status_code=0):
+                 exec_code=0, exec_stdout="", exec_stderr="", status_code=0,
+                 machine_list=""):
         self.calls = []
         self.state = state
         self.labels = labels
@@ -63,6 +64,7 @@ class Recorder:
         self.exec_stdout = exec_stdout
         self.exec_stderr = exec_stderr
         self.status_code = status_code
+        self.machine_list = machine_list
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
@@ -80,6 +82,8 @@ class Recorder:
             return completed(argv, 0, status_record(name, self.state, self.labels))
         if "machine exec" in verb:
             return completed(argv, self.exec_code, self.exec_stdout, self.exec_stderr)
+        if "machine ls" in verb:
+            return completed(argv, 0, self.machine_list or "[]")
         return completed(argv, 0)
 
     def call_containing(self, *parts):
@@ -221,6 +225,131 @@ class SmolvmConfigTests(unittest.TestCase):
         names = config.resolved_environment["OMNIGENT_RUNNER_ENV_PASSTHROUGH"].split(",")
         self.assertEqual(names, ["APP_KEY", "GH_TOKEN", "EXTRA"])
         self.assertEqual(SmolvmConfig(image="a", environment={}).resolved_environment, {})
+
+
+class DynamicPortTests(unittest.TestCase):
+    def configure(self, **overrides):
+        settings = dict(image="alpine", dynamic_port_range=(30000, 30010), dynamic_port_count=3)
+        settings.update(overrides)
+        return SmolvmConfig(**settings)
+
+    def test_config_requires_a_range_and_a_count_together(self):
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(image="a", dynamic_port_count=10)
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(image="a", dynamic_port_range=(30000, 40000))
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(image="a", dynamic_port_range=(40000, 30000), dynamic_port_count=1)
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(image="a", dynamic_port_range=(30000, 30002), dynamic_port_count=10)
+        with self.assertRaises(ValidationError):
+            SmolvmConfig(image="a", dynamic_port_range=(1, 100), dynamic_port_count=1)
+
+    def test_config_counts_fixed_mappings_against_the_cap(self):
+        fixed = [f"{20000 + index}:{index + 1}" for index in range(60)]
+        SmolvmConfig(
+            image="a", ports=fixed, dynamic_port_range=(30000, 30009), dynamic_port_count=4
+        )
+        with self.assertRaisesRegex(ValidationError, "fixed plus dynamic"):
+            SmolvmConfig(
+                image="a", ports=fixed, dynamic_port_range=(30000, 30009), dynamic_port_count=5
+            )
+
+    @patch(f"{_MODULE}._port_available", return_value=True)
+    def test_allocation_takes_the_lowest_free_ports(self, _available):
+        launcher = SmolvmSandboxLauncher(config=self.configure())
+        self.assertEqual(launcher._allocate_ports(), [30000, 30001, 30002])
+
+    @patch(f"{_MODULE}._port_available")
+    def test_allocation_skips_busy_and_claimed_ports(self, available):
+        available.side_effect = lambda port: port not in {30000, 30002}
+        launcher = SmolvmSandboxLauncher(config=self.configure())
+        with patch.object(
+            SmolvmSandboxLauncher,
+            "_claimed_ports",
+            return_value={30001},
+        ):
+            self.assertEqual(launcher._allocate_ports(), [30003, 30004, 30005])
+
+    @patch(f"{_MODULE}._port_available", return_value=True)
+    def test_allocation_fails_clearly_when_the_range_is_exhausted(self, _available):
+        launcher = SmolvmSandboxLauncher(config=self.configure())
+        with patch.object(SmolvmSandboxLauncher, "_claimed_ports", return_value=set(range(30000, 30010))):
+            with self.assertRaisesRegex(click.ClickException, "only 1 of 3 free host ports"):
+                launcher._allocate_ports()
+
+    def test_no_dynamic_ports_means_no_allocation(self):
+        launcher = SmolvmSandboxLauncher(config=SmolvmConfig(image="alpine"))
+        self.assertEqual(launcher._allocate_ports(), [])
+
+    def test_claimed_ports_reads_labels_and_published_ports(self):
+        machines = json.dumps(
+            [
+                {
+                    "labels": {"omnigent.managed": "true", "omnigent.ports": "31000,31001"},
+                    "published_ports": [{"host": 31002, "guest": 31002}],
+                },
+                {
+                    "labels": {"omnigent.managed": "true"},
+                    "published_ports": [{"host": 31003, "guest": 31003}],
+                },
+                {"labels": {"other": "true"}, "published_ports": [{"host": 31004}]},
+            ]
+        )
+        launcher = SmolvmSandboxLauncher(config=SmolvmConfig(image="alpine"))
+        with patch(f"{_MODULE}.subprocess.run") as run:
+            run.side_effect = Recorder(machine_list=machines)
+            self.assertEqual(launcher._claimed_ports(), {31000, 31001, 31002, 31003})
+
+    @patch(f"{_MODULE}.secrets.token_hex", side_effect=["aabbccdd", "deadbeef"])
+    @patch(f"{_MODULE}._port_available", return_value=True)
+    @patch(f"{_MODULE}.subprocess.run")
+    def test_provision_publishes_the_allocation(self, run, _available, _token):
+        recorder = Recorder()
+        run.side_effect = recorder
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = SmolvmSandboxLauncher(
+                config=SmolvmConfig(
+                    image="alpine",
+                    dynamic_port_range=(30000, 30010),
+                    dynamic_port_count=2,
+                    agent_workspace=True,
+                    agent_workspace_root=Path(directory),
+                )
+            )
+            machine = launcher.provision("session")
+            create_argv = " ".join(recorder.call_containing("machine create"))
+            self.assertIn("--port 30000:30000", create_argv)
+            self.assertIn("--port 30001:30001", create_argv)
+            self.assertIn("omnigent.ports=30000,30001", create_argv)
+            note = (Path(directory) / "session" / "sandbox-info.md").read_text()
+        self.assertIn("http://127.0.0.1:30000/", note)
+        self.assertIn(machine, note)
+        exec_scripts = [kwargs.get("input") or "" for _, kwargs in recorder.calls]
+        self.assertTrue(any("/root/sandbox-info.md" in script for script in exec_scripts))
+
+    def test_sandbox_note_states_when_no_ports_are_published(self):
+        launcher = SmolvmSandboxLauncher(config=SmolvmConfig(image="alpine"))
+        note = launcher._sandbox_info("omni-x", [])
+        self.assertIn("No ports are published", note)
+        self.assertIn("100.96.0.1", note)
+
+    def test_sandbox_note_groups_the_hostname_allowlist(self):
+        launcher = SmolvmSandboxLauncher(
+            config=SmolvmConfig(
+                image="alpine",
+                allow_host_patterns=["pypi.org", "*.pypi.org"],
+                allow_hosts=["api.github.com"],
+                block_private=True,
+                allow_private=["100.96.0.0/30"],
+            )
+        )
+        note = launcher._sandbox_info("omni-x", [])
+        self.assertIn("hostnames are default-deny", note)
+        self.assertIn("`api.github.com`, `pypi.org`, `*.pypi.org`", note)
+        self.assertIn("does not resolve", note)
+        self.assertIn("`100.96.0.0/30` is re-opened", note)
+        self.assertNotIn("egress is unrestricted", note)
 
 
 class SmolvmLauncherTests(unittest.TestCase):

@@ -7,16 +7,21 @@ network stack rather than by anything the guest can edit.
 
 from __future__ import annotations
 
+import fcntl
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
-from contextlib import closing
+import tempfile
+from contextlib import closing, contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import click
 import keyring
@@ -39,6 +44,9 @@ _MANAGED_LABEL = "omnigent.managed"
 _PROFILE_LABEL = "omnigent.provider"
 _SESSION_LABEL = "omnigent.session-name"
 _WORKSPACE_LABEL = "omnigent.workspace"
+
+#: Where the provider records the host ports it handed this machine.
+_PORTS_LABEL = "omnigent.ports"
 
 #: Prefix for the host-side environment variables that carry a keyring secret to
 #: one ``machine exec``. smolvm resolves ``--secret-env GUEST=HOST`` from the
@@ -126,6 +134,33 @@ def _missing_machine(result: subprocess.CompletedProcess[str]) -> bool:
     if _error_code(result) != "CONFIG_ERROR":
         return False
     return bool(_MISSING_MACHINE.search(_error_message(result).strip()))
+
+
+def _port_available(port: int) -> bool:
+    """Whether this host can bind *port* on every interface right now."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+    return True
+
+
+@contextmanager
+def _port_lock() -> Iterator[None]:
+    """Serialize port selection across concurrent provisions.
+
+    Probing and creating are separate steps, so without a lock two launches
+    could pick the same free port and the second would fail at start.
+    """
+    path = Path(tempfile.gettempdir()) / f"omnigent-smolvm-ports-{os.getuid()}.lock"
+    with open(path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def _private_directory(path: Path) -> None:
@@ -436,7 +471,11 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
     # --------------------------------------------------------------- provision
 
     def _create_args(
-        self, machine_name: str, safe_name: str, workspace: Path | None
+        self,
+        machine_name: str,
+        safe_name: str,
+        workspace: Path | None,
+        dynamic_ports: list[int] | None = None,
     ) -> list[str]:
         """Return the ``machine create`` arguments for this profile.
 
@@ -445,6 +484,7 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
         stale, and ``machine ls --json`` never shows one.
         """
         config = self.config
+        dynamic_ports = dynamic_ports or []
         args = [
             "--name",
             machine_name,
@@ -489,6 +529,10 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
             args.extend(["--credential", binding.render()])
         for mapping in config.ports:
             args.extend(["--port", mapping])
+        for port in dynamic_ports:
+            args.extend(["--port", f"{port}:{port}"])
+        if dynamic_ports:
+            args.extend(["--label", f"{_PORTS_LABEL}={','.join(str(p) for p in dynamic_ports)}"])
         if workspace is not None:
             args.extend(["--label", f"{_WORKSPACE_LABEL}={workspace}"])
             args.extend(
@@ -517,13 +561,15 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-.")[:48] or "session"
         machine_name = f"omni-{safe_name}-{secrets.token_hex(4)}"
         workspace = self._workspace_directory(safe_name)
-        created = self._smolvm(
-            "machine",
-            "create",
-            *self._create_args(machine_name, safe_name, workspace),
-            sandbox_id=machine_name,
-            timeout=300,
-        )
+        with _port_lock():
+            dynamic_ports = self._allocate_ports()
+            created = self._smolvm(
+                "machine",
+                "create",
+                *self._create_args(machine_name, safe_name, workspace, dynamic_ports),
+                sandbox_id=machine_name,
+                timeout=300,
+            )
         if created.returncode:
             raise self._failed("smolvm could not create the managed sandbox", created)
         started = self._smolvm(
@@ -542,12 +588,176 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
                 raise click.ClickException(
                     "smolvm reported success but the sandbox is not running"
                 )
+            self._write_sandbox_info(machine_name, workspace, dynamic_ports)
             if self.config.bootstrap_command is not None:
                 self.run(machine_name, self.config.bootstrap_command)
         except BaseException:
             self._discard(machine_name)
             raise
         return machine_name
+
+    # ------------------------------------------------------------------ ports
+
+    def _claimed_ports(self) -> set[int]:
+        """Host ports already promised to a machine this provider created."""
+        result = self._smolvm("machine", "ls", "--json")
+        if result.returncode:
+            return set()
+        try:
+            machines = json.loads(result.stdout or "[]")
+        except ValueError:
+            return set()
+        ports: set[int] = set()
+        if not isinstance(machines, list):
+            return ports
+        for machine in machines:
+            if not isinstance(machine, dict):
+                continue
+            labels = machine.get("labels") or {}
+            if not isinstance(labels, dict) or labels.get(_MANAGED_LABEL) != "true":
+                continue
+            for item in str(labels.get(_PORTS_LABEL, "")).split(","):
+                if item.strip().isdigit():
+                    ports.add(int(item.strip()))
+            for entry in machine.get("published_ports") or []:
+                if isinstance(entry, dict) and isinstance(entry.get("host"), int):
+                    ports.add(entry["host"])
+        return ports
+
+    def _allocate_ports(self) -> list[int]:
+        """Pick this machine's slice of free host ports from the configured range.
+
+        Host ports are machine-global, so a shared profile cannot use a fixed
+        pool: the second sandbox would collide with the first. Each machine asks
+        for its own free ports instead, and the mapping is published to the
+        guest and to the machine's labels.
+
+        :returns: Host ports, each mapped to the same guest port.
+        :raises click.ClickException: When the range cannot supply the request.
+        """
+        count = self.config.dynamic_port_count
+        if not count:
+            return []
+        assert self.config.dynamic_port_range is not None  # validated by config
+        start, end = self.config.dynamic_port_range
+        claimed = self._claimed_ports()
+        chosen: list[int] = []
+        for port in range(start, end + 1):
+            if len(chosen) == count:
+                break
+            if port in claimed or not _port_available(port):
+                continue
+            chosen.append(port)
+        if len(chosen) < count:
+            raise click.ClickException(
+                f"smolvm found only {len(chosen)} of {count} free host ports in "
+                f"{start}-{end}; widen dynamic_port_range or free some ports"
+            )
+        return chosen
+
+    # ----------------------------------------------------------- sandbox file
+
+    def _sandbox_info(self, machine_name: str, dynamic_ports: list[int]) -> str:
+        """Render the "about your sandbox" note the agent reads first."""
+        config = self.config
+        subnet = config.guest_subnet or "100.96.0.0/30"
+        gateway = str(next(iter(ipaddress.ip_network(subnet).hosts())))
+        lines = [
+            "# About your sandbox",
+            "",
+            "You are inside a microVM, not a container on the host. It has its own",
+            "kernel, its own disk, and a network policy the guest cannot change.",
+            "",
+            "| Fact | Value |",
+            "|---|---|",
+            f"| Provider | `{self.provider}` |",
+            f"| Machine | `{machine_name}` |",
+            f"| Image | `{config.image}` |",
+            f"| Host gateway | `{gateway}` |",
+            f"| Working directory | `{config.workdir or '/'}` |",
+        ]
+        if config.agent_workspace:
+            lines.append(f"| Agent work directory | `{config.agent_workspace_container_target}` |")
+        lines.extend(
+            [
+                "",
+                "## Ports",
+                "",
+            ]
+        )
+        if dynamic_ports:
+            lines.append(
+                "The host publishes these ports to this machine. Serve on the guest"
+                " port; the human opens the host port."
+            )
+            lines.append("")
+            lines.append("| Host | Guest | Host URL |")
+            lines.append("|---|---|---|")
+            for port in dynamic_ports:
+                lines.append(f"| {port} | {port} | http://127.0.0.1:{port}/ |")
+        else:
+            lines.append(
+                "No ports are published. A listener inside the guest is reachable"
+                " from the guest only."
+            )
+        lines.extend(
+            [
+                "",
+                "## Egress",
+                "",
+            ]
+        )
+        rules: list[str] = []
+        if config.block_private:
+            rules.append("the LAN, cloud metadata, and CGNAT are blocked")
+        for cidr in config.allow_private:
+            rules.append(f"`{cidr}` is re-opened under that block")
+        for cidr in config.allow_cidrs:
+            rules.append(f"`{cidr}` is allowed")
+        for cidr in config.deny_cidrs:
+            rules.append(f"`{cidr}` is denied")
+        named = list(config.allow_hosts) + list(config.allow_host_patterns)
+        if named:
+            rules.append(
+                "hostnames are default-deny; only these resolve: "
+                + ", ".join(f"`{name}`" for name in named)
+            )
+            rules.append(
+                "any other name does not resolve, and a bare IP address has no"
+                " route, so retrying or substituting an address will not help"
+            )
+        if not rules:
+            rules.append("egress is unrestricted while the machine has a network")
+        lines.extend(f"- {rule}" for rule in rules)
+        lines.extend(
+            [
+                "",
+                "The host loopback is reached through the gateway address above, not",
+                "through 127.0.0.1 inside this machine.",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _write_sandbox_info(
+        self, machine_name: str, workspace: Path | None, dynamic_ports: list[int]
+    ) -> None:
+        """Place the sandbox note where the agent and the operator can read it."""
+        try:
+            info = self._sandbox_info(machine_name, dynamic_ports)
+        except ValueError:  # a malformed subnet is reported by config validation
+            return
+        if workspace is not None:
+            try:
+                (workspace / "sandbox-info.md").write_text(info, encoding="utf-8")
+            except OSError:
+                _LOGGER.debug("could not write the host-side sandbox note", exc_info=True)
+        marker = f"OMNIGENT_SANDBOX_{secrets.token_hex(8)}"
+        script = (
+            f"cat > /root/sandbox-info.md <<'{marker}'\n{info}{marker}\n"
+            "chmod 0644 /root/sandbox-info.md\n"
+        )
+        self.run(machine_name, script, check=False)
 
     def _discard(self, machine_name: str) -> None:
         """Best-effort removal of a machine that never became usable."""

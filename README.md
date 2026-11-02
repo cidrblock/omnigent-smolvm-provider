@@ -69,9 +69,12 @@ smolvm unless the profile raises `--max-image-size`.
     memory_mib: 8192
     net_backend: virtio-net
     allow_hosts: ["api.github.com"]
-    allow_host_patterns: ["*.example.com"]
+    allow_host_patterns: ["pypi.org", "*.pypi.org"]
     block_private: true
     allow_private: ["100.96.0.0/30"]
+    # A per-session slice of host ports (see "Ports are machine-global").
+    dynamic_port_range: [30000, 40000]
+    dynamic_port_count: 10
     mounts:
       - {source: /home/me/repo, target: /root/workspace, mode: rw}
     keys:
@@ -109,7 +112,29 @@ with none:
 ```
 
 smolvm cannot allocate a host port on its own (`-p 0:8080` is rejected), so a
-port has to be chosen when the machine is created.
+port has to be chosen when the machine is created — which is what
+`dynamic_port_range` is for. Ask for a count and a range and the provider
+picks, per session:
+
+```yaml
+    dynamic_port_range: [30000, 40000]
+    dynamic_port_count: 10
+```
+
+At provision time it takes a host-wide lock, reads the ports every other
+managed machine already holds (the `omnigent.ports` label plus
+`published_ports` from `machine ls --json`), takes the lowest free ones and
+passes each as `--port N:N`, so the host port and the guest port are the same
+number. Concurrent sandboxes get disjoint slices; a range that cannot cover the
+request fails with `only N of M free host ports …` before anything is created.
+The two settings must be given together, and fixed plus dynamic mappings may
+not exceed smolvm's 64.
+
+The allocation is written to the machine's labels, to `<workspace>/sandbox-info.md`
+on the host, and to `/root/sandbox-info.md` in the guest — together with the
+provider, image, host gateway, work directory and the egress rules the machine
+actually got. Agents are pointed at that file, so they learn which host ports
+are theirs instead of guessing.
 
 ## Mounts, and why they are directories
 
