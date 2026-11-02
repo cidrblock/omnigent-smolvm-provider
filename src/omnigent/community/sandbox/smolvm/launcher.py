@@ -337,9 +337,12 @@ class SmolvmSandboxLauncher(ExecModelHostLauncher):
     ) -> list[str]:
         """Return the ``machine create`` arguments for this profile.
 
-        Secrets are deliberately absent: they are supplied per exec with
-        ``--secret-env`` so a machine record never holds a reference that goes
-        stale, and ``machine ls --json`` never shows one.
+        Secrets travel as references only (``--secret-keychain``,
+        ``--secret-env``, ``--secret-file``): smolvm resolves each one on the
+        host at machine start, so the value is never in this argv, in the
+        machine record, or in ``machine ls --json``. Credential bindings add
+        their own source flag plus ``--credential``; the guest sees only the
+        placeholder.
         """
         config = self.config
         dynamic_ports = dynamic_ports or []
