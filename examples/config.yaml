@@ -21,8 +21,15 @@ sandbox:
         ports: ["8080:8080", "3000:3000"]
         allow_hosts: ["api.github.com"]
         allow_host_patterns: ["*.example.com"]
+        # smolvm mounts directories only. Single files (AGENTS.md, gitconfig,
+        # ssh keys) are staged into one directory and copied over / once, on
+        # the machine's first start.
         mounts:
           - {source: /home/me/repo, target: /root/repo, mode: rw}
+          - {source: /home/me/.omnigent/sandbox/smolvm/root,
+             target: /root/.omnigent-sandbox, mode: ro}
+        init:
+          - cp -a /root/.omnigent-sandbox/. / && chown -R root:root /root/workspace
         keys:
           - {keyring: Agents, description: github, env_var: GH_TOKEN}
         agent_workspace: true

@@ -85,6 +85,34 @@ Every secret is resolved on the host at exec time and delivered with
 `--secret-env`, so the value never appears in the machine record, the Smolfile,
 a log, or the process argv.
 
+## Mounts, and why they are directories
+
+smolvm exposes host directories, not single files (`-v` takes a directory
+source; a file would silently become one). Profiles that need a specific file
+in a specific place mount one staging directory and copy it over `/` with a
+single `--init` command:
+
+```yaml
+mounts:
+  - {source: /home/me/.omnigent/sandbox/smolvm/root, target: /root/.omnigent-sandbox, mode: ro}
+init:
+  - cp -a /root/.omnigent-sandbox/. / && chown -R root:root /root/workspace
+```
+
+`cp -a` preserves the host owner, and inside the guest that owner is a bare
+uid nobody uses, so `chown` back to root is part of the command. The copy runs
+once, on the machine's first start; machines already created keep what they
+booted with.
+
+## Lifecycle
+
+A machine is a process on the host. If the Omnigent server's own service is
+configured with `KillMode=control-group`, restarting it stops every machine
+belonging to that unit. smolvm notices and reports those machines as
+`stopped` rather than leaving a stale `running` record, so `resume()` starts
+them again with their disks intact — but nothing restarts them automatically.
+Machines started outside the unit's cgroup are unaffected.
+
 ## Deliberate omissions
 
 `smolvm` supports credentials brokered at the gateway (`--credential`),
