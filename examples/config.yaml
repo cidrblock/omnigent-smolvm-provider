@@ -1,0 +1,24 @@
+# A managed smolvm profile. Add under `sandbox.providers` in the Omnigent
+# config, then launch with `provider: smolvm-default`.
+sandbox:
+  providers:
+    - provider: smolvm-default
+      server_url: http://127.0.0.1:6767
+      smolvm-default:
+        image: alpine:3.20
+        cpus: 4
+        memory_mib: 8192
+        # Host-to-guest slots. Agents can serve anything inside the guest and
+        # relay it onto one of these; add more here if you need more at once.
+        ports: ["8080:8080", "3000:3000"]
+        allow_hosts: ["api.github.com"]
+        allow_host_patterns: ["*.example.com"]
+        block_private: true
+        mounts:
+          - {source: /home/me/repo, target: /root/repo, mode: rw}
+        keys:
+          - {keyring: Agents, description: github, env_var: GH_TOKEN}
+        agent_workspace: true
+        agent_workspace_root: /home/me/agent_work
+        # Each sandbox gets its own smolvm store, at the cost of one image pull.
+        state_dir_root: /home/me/.local/share/omnigent/smolvm
