@@ -190,9 +190,11 @@ class SmolvmConfig(BaseModel):
     outbound_localhost_only: bool = False
     credentials: list[CredentialBinding] = Field(default_factory=list)
 
-    #: Host-to-guest TCP/UDP mappings, fixed at create time. A guest-side relay
-    #: can move a container's port onto one of these slots, so this is a pool of
-    #: concurrently reachable ports, not a limit on what the agent may serve.
+    #: Host-to-guest TCP/UDP mappings, fixed at create time and machine-global:
+    #: smolvm refuses to start a second machine on a host port a running one
+    #: already holds. Two sandboxes sharing a profile therefore cannot both
+    #: publish the same host port, so leave this empty on a shared profile and
+    #: publish from a per-session alias instead.
     ports: list[str] = Field(default_factory=list)
 
     env: list[str] = Field(default_factory=list)

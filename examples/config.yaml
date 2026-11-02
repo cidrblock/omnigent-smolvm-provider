@@ -16,9 +16,13 @@ sandbox:
         net_backend: virtio-net
         block_private: true
         allow_private: ["100.96.0.0/30"]
-        # Host-to-guest slots. Agents can serve anything inside the guest and
-        # relay it onto one of these; add more here if you need more at once.
-        ports: ["8080:8080", "3000:3000"]
+        # No ports here. A published host port is machine-global: smolvm will
+        # not start a second machine on a port a running one already holds, so
+        # two sandboxes from this profile would exclude each other. Publish
+        # from a separate alias instead:
+        #   - provider: smolvm-ui
+        #     server_url: http://100.96.0.1:6767
+        #     smolvm-ui: {image: ..., net_backend: virtio-net, ports: ["8081:8080"]}
         allow_hosts: ["api.github.com"]
         allow_host_patterns: ["*.example.com"]
         # smolvm mounts directories only. Single files (AGENTS.md, gitconfig,

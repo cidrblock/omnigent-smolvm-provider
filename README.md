@@ -67,7 +67,6 @@ smolvm unless the profile raises `--max-image-size`.
     image: alpine:3.20
     cpus: 4
     memory_mib: 8192
-    ports: ["8080:8080"]
     net_backend: virtio-net
     allow_hosts: ["api.github.com"]
     allow_host_patterns: ["*.example.com"]
@@ -84,6 +83,33 @@ smolvm unless the profile raises `--max-image-size`.
 Every secret is resolved on the host at exec time and delivered with
 `--secret-env`, so the value never appears in the machine record, the Smolfile,
 a log, or the process argv.
+
+## Ports are machine-global
+
+`ports:` publishes host ports, and a host port belongs to whichever machine
+holds it. Starting a second machine on one already in use fails:
+
+```text
+config operation failed: start machine: host port 8080 is already in use by
+running machine 'omni-managed-…' (CONFIG_ERROR)
+```
+
+So a shared profile should not declare ports — otherwise its sandboxes exclude
+each other, which only shows up when the second one launches. Give the
+sandboxes that need a listener their own alias, and let the plain profile run
+with none:
+
+```yaml
+- provider: smolvm-ui
+  server_url: http://100.96.0.1:6767
+  smolvm-ui:
+    image: /home/me/.omnigent/sandbox/smolvm/omnigent-host-fedora-1.tar
+    net_backend: virtio-net
+    ports: ["8081:8080"]      # one at a time, by design
+```
+
+smolvm cannot allocate a host port on its own (`-p 0:8080` is rejected), so a
+port has to be chosen when the machine is created.
 
 ## Mounts, and why they are directories
 
